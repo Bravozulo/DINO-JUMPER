@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Dino Runner</title>
+  <style>
+    :root {
+      --bg: #0b0c10;
+      --panel: #11131a;
+      --ink: #e6e6ea;
+      --accent: #7df9ff;
+      --muted: #9aa0a6;
+      --danger: #ff6b6b;
+      --shadow: 0 10px 30px rgba(0,0,0,.35);
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body {
+      margin: 0;
+      display: grid;
+      place-items: center;
+      background: radial-gradient(1200px 600px at 50% -10%, #152032 0%, var(--bg) 50%, #08090c 100%);
+      color: var(--ink);
+      font: 16px/1.4 system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, 'Helvetica Neue', Arial, 'Noto Sans', 'Apple Color Emoji', 'Segoe UI Emoji';
+    }
+    .wrap {
+      width: min(920px, 96vw);
+    }
+    header {
+      display:flex; align-items:center; justify-content:space-between;
+      margin: 20px 0 10px;
+      gap: 12px;
+    }
+    h1 { font-size: clamp(18px, 4vw, 24px); margin:0; letter-spacing:.3px; }
+    header .controls { display:flex; gap: 8px; align-items:center; color: var(--muted); font-size: 14px; }
+    header .btn {
+      appearance:none; border:0; border-radius: 14px; padding:10px 14px; cursor:pointer; font-weight:600;
+      background: linear-gradient(180deg, #192236, #0f1320);
+      color: var(--ink); box-shadow: var(--shadow);
+    }
+    header .btn:hover { filter: brightness(1.08); }
+    header .btn:active { transform: translateY(1px); }
+
+    canvas {
+      width: 100%;
+      aspect-ratio: 3 / 1; /* Responsive 900x300 */
+      display:block; border-radius: 18px; background: #0d1018; box-shadow: var(--shadow);
+      outline: 1px solid rgba(255,255,255,.04);
+      image-rendering: crisp-edges; image-rendering: pixelated;
+      touch-action: manipulation; /* so taps are immediate */
+    }
+
+    .hint { color: var(--muted); margin: 10px 4px 0; font-size: 14px; }
+
+    /* Mobile jump button (optional) */
+    .jump {
+      position: fixed; right: 18px; bottom: 18px; z-index: 10;
+      padding: 12px 16px; border-radius: 14px; border: 0; cursor: pointer;
+      background: linear-gradient(180deg, #1a2a3f, #101a2a);
+      color: var(--ink); font-weight: 700; box-shadow: var(--shadow);
+    }
+    @media (pointer:fine) {
+      .jump { display:none; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>🦖 Dino Runner</h1>
+      <div class="controls">
+        <button class="btn" id="startBtn" title="Start / Restart (Enter)">Start</button>
+        <button class="btn" id="pauseBtn" title="Pause (P)">Pause</button>
+      </div>
+    </header>
+    <canvas id="game" aria-label="Dino runner game" role="img"></canvas>
+    <p class="hint">Press <strong>Space / ↑ / W</strong> or <strong>Tap/Click</strong> to jump. Press <strong>P</strong> to pause. Press <strong>Enter</strong> to start or restart. Your best score is saved locally.</p>
+  </div>
+  <button class="jump" id="jumpBtn" aria-label="Jump">Jump ⤴</button>
+
+  <script>
+  (() => {
+    const canvas = document.getElementById('game');
+    const ctx = canvas.getContext('2d');
+
+    // Logical game size (virtual units). Canvas will scale to device pixels.
+    const WORLD_W = 900;
+    const WORLD_H = 300;
+
+    let dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+    function resize() {
+      // Maintain aspect via CSS; back buffer uses DPR for crisp text/lines
+      const rect = canvas.getBoundingClientRect();
+      canvas.width = Math.floor(rect.width * dpr);
+      canvas.height = Math.floor(rect.height * dpr);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0); // draw in CSS pixels
+    }
+    const ro = new ResizeObserver(() => resize());
+    ro.observe(canvas);
+    resize();
+
+    // Game state
+    const STATE = { MENU:0, PLAYING:1, PAUSED:2, OVER:3 };
+    let state = STATE.MENU;
+    let lastTime = 0;
+    let accumulator = 0;
+    const FIXED_DT = 1/120; // physics tick
+
+    // World parameters
+    const gravity = 2200; // px/s^2
+    const groundY = WORLD_H - 48;
+
+    const player = {
+      x: 90, y: groundY - 42, w: 46, h: 42,
+      vy: 0, onGround: true,
+      jumpStrength: 840,
+      anim: 0
+    };
+
+    const obstacles = [];
+    const clouds = [];
+    let speed = 380; // world scroll speed (px/s)
+    let score = 0;
+    let hi = Number(localStorage.getItem('dino-hi')||0) || 0;
+    let spawnTimer = 0;
+    let cloudTimer = 0;
+
+    function reset() {
+      player.y = groundY - player.h;
+      player.vy = 0;
+      player.onGround = true;
+      player.anim = 0;
+      obstacles.length = 0;
+      clouds.length = 0;
+      speed = 380;
+      score = 0;
+      spawnTimer = 0;
+      cloudTimer = 0;
+    }
+
+    function rng(min, max){ return Math.random()*(max-min)+min; }
+
+    function jump() {
+      if (state !== STATE.PLAYING) return;
+      if (player.onGround) {
+        player.vy = -player.jumpStrength;
+        player.onGround = false;
+      }
+    }
+
+    // Input
+    window.addEventListener('keydown', (e) => {
+      if (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'KeyW') {
+        e.preventDefault();
+        if (state === STATE.MENU) startGame();
+        else if (state === STATE.OVER) startGame();
+        else jump();
+      }
+      if (e.code === 'Enter') {
+        e.preventDefault();
+        if (state === STATE.PAUSED) resume();
+        else startGame();
+      }
+      if (e.code === 'KeyP') togglePause();
+    }, { passive:false });
+
+    canvas.addEventListener('pointerdown', (e) => {
+      if (state === STATE.MENU || state === STATE.OVER) startGame();
+      else jump();
+    });
+    document.getElementById('jumpBtn').addEventListener('click', () => {
+      if (state === STATE.MENU || state === STATE.OVER) startGame();
+      else jump();
+    });
+
+    document.getElementById('startBtn').addEventListener('click', () => {
+      if (state === STATE.PAUSED) resume(); else startGame();
+    });
+    document.getElementById('pauseBtn').addEventListener('click', () => togglePause());
+
+    function startGame(){ reset(); state = STATE.PLAYING; lastTime = performance.now(); }
+    function togglePause(){ if (state===STATE.PLAYING) state=STATE.PAUSED; else if (state===STATE.PAUSED) resume(); }
+    function resume(){ state = STATE.PLAYING; lastTime = performance.now(); }
+
+    // Entity spawners
+    function spawnObstacle(){
+      const type = Math.random() < 0.8 ? 'cactus' : 'ptero';
+      if (type === 'cactus') {
+        const size = Math.random()<0.6 ? 1 : (Math.random()<0.5?2:3);
+        const w = 22*size, h = 36 + (size-1)*16;
+        obstacles.push({ type, x: WORLD_W + rng(10,40), y: groundY - h, w, h, hit:false });
+      } else {
+        const y = groundY - (Math.random()<0.5 ? 110 : 70);
+        obstacles.push({ type, x: WORLD_W + rng(10,40), y, w: 46, h: 26, flap:0, hit:false });
+      }
+    }
+
+    function spawnCloud(){
+      clouds.push({ x: WORLD_W + rng(0,80), y: rng(30,120), w: rng(60,120), h: rng(16,28), v: rng(20,50) });
+    }
+
+    function update(dt){
+      // difficulty curve
+      speed += dt * 4; // slowly ramp up
+
+      // player physics
+      player.vy += gravity * dt;
+      player.y += player.vy * dt;
+      if (player.y + player.h >= groundY) { player.y = groundY - player.h; player.vy = 0; player.onGround = true; }
+
+      // animate running
+      player.anim += dt * (player.onGround ? 14 : 8);
+
+      // spawn obstacles
+      spawnTimer -= dt;
+      if (spawnTimer <= 0) {
+        spawnObstacle();
+        const minGap = 260 - Math.min(120, speed*0.1);
+        const maxGap = 420 - Math.min(180, speed*0.12);
+        spawnTimer = rng(minGap, maxGap) / speed; // seconds until next spawn
+      }
+
+      // move obstacles & collision
+      for (let i=obstacles.length-1; i>=0; i--) {
+        const o = obstacles[i];
+        o.x -= speed * dt;
+        if (o.type==='ptero') o.flap += dt*8;
+        if (o.x + o.w < -20) obstacles.splice(i,1);
+      }
+
+      // clouds
+      cloudTimer -= dt;
+      if (cloudTimer <= 0){ spawnCloud(); cloudTimer = rng(1.5, 3.5); }
+      for (let i=clouds.length-1; i>=0; i--) {
+        const c = clouds[i];
+        c.x -= c.v * dt;
+        if (c.x + c.w < -40) clouds.splice(i,1);
+      }
+
+      // scoring
+      score += dt * 10; // points per second
+      if (score > hi) { hi = Math.floor(score); localStorage.setItem('dino-hi', hi); }
+
+      // collisions (AABB with small forgiveness)
+      const pad = 6;
+      for (const o of obstacles){
+        if (rectsOverlap(player.x+pad, player.y+pad, player.w-2*pad, player.h-2*pad, o.x+pad, o.y+pad, o.w-2*pad, o.h-2*pad)) {
+          state = STATE.OVER;
+          break;
+        }
+      }
+    }
+
+    function rectsOverlap(ax, ay, aw, ah, bx, by, bw, bh){
+      return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
+    }
+
+    // Rendering helpers
+    function clear(){
+      ctx.clearRect(0,0,canvas.clientWidth,canvas.clientHeight);
+      // vignette backdrop inside canvas
+      const grd = ctx.createLinearGradient(0,0,0,canvas.clientHeight);
+      grd.addColorStop(0, '#0b1220');
+      grd.addColorStop(1, '#0a0f19');
+      ctx.fillStyle = grd;
+      ctx.fillRect(0,0,canvas.clientWidth,canvas.clientHeight);
+    }
+
+    function drawGround(){
+      // ground line
+      ctx.strokeStyle = '#1c2436';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(0, groundY);
+      ctx.lineTo(canvas.clientWidth, groundY);
+      ctx.stroke();
+
+      // dashed track
+      const dashY = groundY + 10;
+      ctx.strokeStyle = '#162030';
+      ctx.lineWidth = 2;
+      ctx.setLineDash([8, 10]);
+      ctx.beginPath();
+      ctx.moveTo(0, dashY);
+      ctx.lineTo(canvas.clientWidth, dashY);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
+    function drawCloud(c){
+      ctx.fillStyle = 'rgba(255,255,255,.08)';
+      roundedRect(c.x, c.y, c.w, c.h, 10, true);
+    }
+
+    function drawDino(){
+      const {x,y,w,h} = player;
+      // body
+      ctx.fillStyle = '#cfe7ff';
+      roundedRect(x, y, w, h, 6, true);
+      // legs (simple run cycle)
+      ctx.fillStyle = '#b8d8ff';
+      const t = Math.floor(player.anim) % 2;
+      const legW = 10, legH = 14;
+      if (player.onGround) {
+        ctx.fillRect(x+8, y+h-2, legW, -legH - (t?4:0));
+        ctx.fillRect(x+w-18, y+h-2, legW, -legH - (!t?4:0));
+      } else {
+        ctx.fillRect(x+8, y+h-2, legW, -legH+4);
+        ctx.fillRect(x+w-18, y+h-2, legW, -legH+4);
+      }
+      // head
+      roundedRect(x+w-16, y-10, 20, 18, 4, true);
+      // eye
+      ctx.fillStyle = '#0d1422';
+      ctx.fillRect(x+w-6, y-2, 3, 3);
+    }
+
+    function drawObstacle(o){
+      if (o.type === 'cactus'){
+        ctx.fillStyle = '#7bd389';
+        roundedRect(o.x, o.y, o.w, o.h, 6, true);
+        // spikes
+        ctx.fillStyle = '#5dbd71';
+        for (let i=0;i<o.w;i+=10){ ctx.fillRect(o.x+i+3, o.y+6, 4, 8); }
+      } else {
+        // pterodactyl
+        ctx.fillStyle = '#c9b6fc';
+        roundedRect(o.x, o.y, o.w, o.h, 6, true);
+        // wings
+        ctx.fillStyle = '#b49af9';
+        const flap = Math.sin(o.flap)*8;
+        roundedRect(o.x-8, o.y-10 - flap, 28, 10, 4, true);
+        roundedRect(o.x+26, o.y-10 + flap, 28, 10, 4, true);
+      }
+    }
+
+    function roundedRect(x,y,w,h,r,fill){
+      ctx.beginPath();
+      ctx.moveTo(x+r, y);
+      ctx.arcTo(x+w, y, x+w, y+h, r);
+      ctx.arcTo(x+w, y+h, x, y+h, r);
+      ctx.arcTo(x, y+h, x, y, r);
+      ctx.arcTo(x, y, x+w, y, r);
+      if (fill) ctx.fill(); else ctx.stroke();
+    }
+
+    function text(txt, x, y, size=16, align='left', color='#e6e6ea', shadow=true){
+      ctx.font = `600 ${size}px system-ui, -apple-system, Segoe UI, Roboto`;
+      ctx.textAlign = align; ctx.textBaseline = 'top';
+      if (shadow){ ctx.fillStyle = 'rgba(0,0,0,.35)'; ctx.fillText(txt, x+1.5, y+1.5); }
+      ctx.fillStyle = color; ctx.fillText(txt, x, y);
+    }
+
+    function drawUI(){
+      text(`Score: ${Math.floor(score).toString().padStart(5,'0')}`, canvas.clientWidth-20, 16, 16, 'right');
+      text(`Best:  ${hi.toString().padStart(5,'0')}`, canvas.clientWidth-20, 36, 14, 'right', '#9aa0a6');
+
+      if (state === STATE.MENU){
+        bigCenter('Press Enter or Click to Start');
+        tips();
+      }
+      if (state === STATE.PAUSED){
+        bigCenter('Paused — Press P or Enter to Resume');
+      }
+      if (state === STATE.OVER){
+        bigCenter('Game Over — Press Enter to Retry');
+        tips();
+      }
+    }
+
+    function tips(){
+      const lines = [
+        'Jump with Space / ↑ / W or Tap',
+        'Obstacles get faster over time',
+        'Your best score is saved on this device'
+      ];
+      lines.forEach((s,i)=> text(s, canvas.clientWidth/2, canvas.clientHeight/2 + 36 + i*18, 14, 'center', '#9aa0a6'));
+    }
+
+    function bigCenter(msg){
+      text(msg, canvas.clientWidth/2, canvas.clientHeight/2 - 8, 18, 'center');
+    }
+
+    // Main loop
+    function loop(ts){
+      requestAnimationFrame(loop);
+      if (state !== STATE.PLAYING) { draw(); return; }
+      const now = ts; if (!lastTime) lastTime = now;
+      let dt = Math.min(0.05, (now - lastTime)/1000);
+      lastTime = now;
+      accumulator += dt;
+      while (accumulator > FIXED_DT){ update(FIXED_DT); accumulator -= FIXED_DT; }
+      draw();
+    }
+
+    function draw(){
+      clear();
+
+      // clouds
+      for (const c of clouds) drawCloud(c);
+
+      // ground & track
+      drawGround();
+
+      // obstacles
+      for (const o of obstacles) drawObstacle(o);
+
+      // dino
+      drawDino();
+
+      // UI overlay
+      drawUI();
+    }
+
+    // Start loop
+    requestAnimationFrame(loop);
+
+    // Accessibility: prevent page scroll on space when focused
+    window.addEventListener('keydown', (e)=>{
+      if (e.code === 'Space') e.preventDefault();
+    }, { passive:false });
+
+    // Reduce motion preference
+    if (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+      // Make the game slightly slower for comfort
+      speed = 300;
+    }
+  })();
+  </script>
+</body>
+</html>
